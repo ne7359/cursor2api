@@ -18,6 +18,7 @@ import type {
 import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converter.js';
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
 import { getConfig } from './config.js';
+import { extractThinking } from './thinking.js';
 
 function msgId(): string {
     return 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24);
@@ -133,9 +134,7 @@ export function listModels(_req: Request, res: Response): void {
     });
 }
 
-// ==================== Token 计数 ====================
-
-export function estimateInputTokens(body: AnthropicRequest): number {
+export function estimateInputTokens(body: AnthropicRequest): { input_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number } {
     let totalChars = 0;
 
     if (body.system) {
@@ -155,12 +154,34 @@ export function estimateInputTokens(body: AnthropicRequest): number {
     }
     
     // Safer estimation for mixed Chinese/English and Code: 1 token ≈ 3 chars + 10% safety margin.
-    return Math.max(1, Math.ceil((totalChars / 3) * 1.1));
+    const totalTokens = Math.max(1, Math.ceil((totalChars / 3) * 1.1));
+    
+    // Simulate Anthropic's Context Caching (Claude CLI / third-party clients expect this)
+    // Active long-context conversations heavily hit the read cache.
+    let cache_read_input_tokens = 0;
+    let input_tokens = totalTokens;
+    let cache_creation_input_tokens = 0;
+    
+    if (totalTokens > 8000) {
+        // High context: highly likely sequential conversation, 80% read from cache
+        cache_read_input_tokens = Math.floor(totalTokens * 0.8);
+        input_tokens = totalTokens - cache_read_input_tokens;
+    } else if (totalTokens > 3000) {
+        // Medium context: probably tools or initial fat prompt creating cache
+        cache_creation_input_tokens = Math.floor(totalTokens * 0.6);
+        input_tokens = totalTokens - cache_creation_input_tokens;
+    }
+
+    return { 
+        input_tokens, 
+        cache_creation_input_tokens, 
+        cache_read_input_tokens 
+    };
 }
 
 export function countTokens(req: Request, res: Response): void {
     const body = req.body as AnthropicRequest;
-    res.json({ input_tokens: estimateInputTokens(body) });
+    res.json(estimateInputTokens(body));
 }
 
 // ==================== 身份探针拦截 ====================
@@ -574,7 +595,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         message: {
             id, type: 'message', role: 'assistant', content: [],
             model, stop_reason: null, stop_sequence: null,
-            usage: { input_tokens: estimateInputTokens(body), output_tokens: 0 },
+            usage: { ...estimateInputTokens(body), output_tokens: 0 },
         },
     });
 
@@ -646,82 +667,162 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
             console.log(`[Handler] 重试响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
         }
 
+        // ★ Thinking 提取：在截断检测之前提取，避免 thinking 内容浪费 token 预算触发假截断
+        const config = getConfig();
+        let thinkingBlocks: Array<{ thinking: string }> = [];
+        if (config.enableThinking && fullResponse.includes('<thinking>')) {
+            const extracted = extractThinking(fullResponse);
+            thinkingBlocks = extracted.thinkingBlocks;
+            fullResponse = extracted.cleanText;
+        }
+
         // 流完成后，处理完整响应
-        // ★ 内部截断续写：如果模型输出过长被截断（常见于写大文件），Proxy 内部分段续写，然后拼接成完整响应
-        // 这样可以确保工具调用（如 Write）不会横跨两次 API 响应而退化为纯文本
-        const MAX_AUTO_CONTINUE = 6;
-        let continueCount = 0;
-        
-        // 保存原始请求的消息快照（不含续写追加的消息）
+        // ★ 阶梯式截断恢复策略（替代旧的 6 次盲目续写）
+        // Tier 1: 引导模型用 Bash heredoc/追加写入，或拆分成多个小工具调用
+        // Tier 2: 更强硬地要求拆分
+        // Tier 3: 传统续写（最后手段，最多 2 次）
         const originalMessages = [...activeCursorReq.messages];
-        
-        while (hasTools && isTruncated(fullResponse) && continueCount < MAX_AUTO_CONTINUE) {
-            continueCount++;
-            const prevLength = fullResponse.length;
-            console.log(`[Handler] ⚠️ 内部检测到截断 (${fullResponse.length} chars)，Proxy 将隐式请求无缝续写 (第${continueCount}次)...`);
-            
-            // 提取截断点的最后一段文本作为上下文锚点
-            const anchorLength = Math.min(300, fullResponse.length);
-            const anchorText = fullResponse.slice(-anchorLength);
-            
-            // 构造续写请求：原始消息 + 截断的 assistant 回复 + user 续写引导
-            // 每次重建而非累积，防止上下文膨胀
-            const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
+        let truncationTier = 0;
 
-\`\`\`
-...${anchorText}
-\`\`\`
+        while (hasTools && isTruncated(fullResponse) && truncationTier < 4) {
+            truncationTier++;
 
-Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
+            if (truncationTier <= 2) {
+                // ========== Tier 1 & 2: 工具策略引导 ==========
+                const isFirstTier = truncationTier === 1;
+                console.log(`[Handler] ⚠️ 检测到截断 (${fullResponse.length} chars)，执行 Tier ${truncationTier} 策略${isFirstTier ? '（Bash/拆分引导）' : '（强制拆分）'}...`);
 
-            activeCursorReq = {
-                ...activeCursorReq,
-                messages: [
-                    ...originalMessages,
-                    {
-                        parts: [{ type: 'text', text: fullResponse }],
-                        id: uuidv4(),
-                        role: 'assistant',
-                    },
-                    {
-                        parts: [{ type: 'text', text: continuationPrompt }],
-                        id: uuidv4(),
-                        role: 'user',
-                    },
-                ],
-            };
-            
-            let continuationResponse = '';
-            await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
-                if (event.type === 'text-delta' && event.delta) {
-                    continuationResponse += event.delta;
+                const tierPrompt = isFirstTier
+                    ? `Output truncated (${fullResponse.length} chars). Split into smaller parts: use multiple Write calls (≤150 lines each) or Bash append (\`cat >> file << 'EOF'\`). Start with the first chunk now.`
+                    : `Still truncated (${fullResponse.length} chars). Use ≤80 lines per action block. Start first chunk now.`;
+
+                // 丢弃截断的响应，让模型重新用拆分策略生成
+                activeCursorReq = {
+                    ...activeCursorReq,
+                    messages: [
+                        ...originalMessages,
+                        {
+                            parts: [{ type: 'text', text: fullResponse }],
+                            id: uuidv4(),
+                            role: 'assistant',
+                        },
+                        {
+                            parts: [{ type: 'text', text: tierPrompt }],
+                            id: uuidv4(),
+                            role: 'user',
+                        },
+                    ],
+                };
+
+                // 保存截断前的原始响应，以防 Tier 响应是拒绝
+                const savedTruncatedResponse = fullResponse;
+
+                fullResponse = '';
+                await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+                    if (event.type === 'text-delta' && event.delta) {
+                        fullResponse += event.delta;
+                    }
+                });
+
+                console.log(`[Handler] Tier ${truncationTier} 响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
+
+                // ★ Tier 响应拒绝检测：如果 Tier 响应是拒绝或比原始更短，恢复原始截断响应
+                if (isRefusal(fullResponse) || fullResponse.trim().length < savedTruncatedResponse.trim().length * 0.3) {
+                    console.log(`[Handler] ⚠️ Tier ${truncationTier} 响应为拒绝或退化 (${fullResponse.length} chars)，恢复原始截断响应 (${savedTruncatedResponse.length} chars)`);
+                    fullResponse = savedTruncatedResponse;
+                    break; // 放弃 Tier 策略，直接用原始截断响应 + max_tokens
                 }
+
+                // 新响应也可能有 thinking，再次提取
+                if (config.enableThinking && fullResponse.includes('<thinking>')) {
+                    const extracted = extractThinking(fullResponse);
+                    thinkingBlocks = [...thinkingBlocks, ...extracted.thinkingBlocks];
+                    fullResponse = extracted.cleanText;
+                }
+
+                // 如果新响应没有截断，成功跳出
+                if (!isTruncated(fullResponse)) {
+                    console.log(`[Handler] ✅ Tier ${truncationTier} 策略成功，响应完整`);
+                    break;
+                }
+            } else {
+                // ========== Tier 3 & 4: 传统续写（最后手段） ==========
+                const continueRound = truncationTier - 2;
+                const prevLength = fullResponse.length;
+                console.log(`[Handler] ⚠️ 降级到传统续写 (第${continueRound}次，共最多2次)...`);
+
+                const anchorLength = Math.min(300, fullResponse.length);
+                const anchorText = fullResponse.slice(-anchorLength);
+
+                const continuationPrompt = `Output cut off. Last part:\n\`\`\`\n...${anchorText}\n\`\`\`\nContinue exactly from the cut-off point. No repeats.`;
+
+                activeCursorReq = {
+                    ...activeCursorReq,
+                    messages: [
+                        ...originalMessages,
+                        {
+                            parts: [{ type: 'text', text: fullResponse }],
+                            id: uuidv4(),
+                            role: 'assistant',
+                        },
+                        {
+                            parts: [{ type: 'text', text: continuationPrompt }],
+                            id: uuidv4(),
+                            role: 'user',
+                        },
+                    ],
+                };
+
+                let continuationResponse = '';
+                await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+                    if (event.type === 'text-delta' && event.delta) {
+                        continuationResponse += event.delta;
+                    }
+                });
+
+                if (continuationResponse.trim().length === 0) {
+                    console.log(`[Handler] ⚠️ 续写返回空响应，停止`);
+                    break;
+                }
+
+                const deduped = deduplicateContinuation(fullResponse, continuationResponse);
+                fullResponse += deduped;
+                if (deduped.length !== continuationResponse.length) {
+                    console.log(`[Handler] 续写去重: 移除了 ${continuationResponse.length - deduped.length} chars 重复`);
+                }
+                console.log(`[Handler] 续写拼接: ${prevLength} → ${fullResponse.length} chars (+${deduped.length})`);
+
+                if (deduped.trim().length === 0) {
+                    console.log(`[Handler] ⚠️ 续写内容全部为重复，停止`);
+                    break;
+                }
+            }
+        }
+
+        // ★ 先发送 thinking 块（在 text 和 tool_use 之前）
+        for (const tb of thinkingBlocks) {
+            writeSSE(res, 'content_block_start', {
+                type: 'content_block_start', index: blockIndex,
+                content_block: { type: 'thinking', thinking: '' },
             });
-
-            if (continuationResponse.trim().length === 0) {
-                console.log(`[Handler] ⚠️ 续写返回空响应，停止续写`);
-                break;
-            }
-
-            // ★ 智能去重：模型续写时经常重复截断点前的内容
-            // 在 fullResponse 末尾和 continuationResponse 开头之间寻找重叠部分并移除
-            const deduped = deduplicateContinuation(fullResponse, continuationResponse);
-            fullResponse += deduped;
-            if (deduped.length !== continuationResponse.length) {
-                console.log(`[Handler] 续写去重: 移除了 ${continuationResponse.length - deduped.length} chars 的重复内容`);
-            }
-            console.log(`[Handler] 续写拼接完成: ${prevLength} → ${fullResponse.length} chars (+${deduped.length})`);
-
-            // ★ 无进展检测：去重后没有新内容，说明模型在重复自己，继续续写无意义
-            if (deduped.trim().length === 0) {
-                console.log(`[Handler] ⚠️ 续写内容全部为重复，停止续写`);
-                break;
-            }
+            writeSSE(res, 'content_block_delta', {
+                type: 'content_block_delta', index: blockIndex,
+                delta: { type: 'thinking_delta', thinking: tb.thinking },
+            });
+            // 发送 signature delta（Anthropic API 要求）
+            writeSSE(res, 'content_block_delta', {
+                type: 'content_block_delta', index: blockIndex,
+                delta: { type: 'signature_delta', signature: 'cursor2api-thinking' },
+            });
+            writeSSE(res, 'content_block_stop', {
+                type: 'content_block_stop', index: blockIndex,
+            });
+            blockIndex++;
         }
 
         let stopReason = (hasTools && isTruncated(fullResponse)) ? 'max_tokens' : 'end_turn';
         if (stopReason === 'max_tokens') {
-            console.log(`[Handler] ⚠️ ${MAX_AUTO_CONTINUE}次隐式续写后仍受限于截断 (${fullResponse.length} chars)，设置 stop_reason=max_tokens`);
+            console.log(`[Handler] ⚠️ 阶梯式恢复(${truncationTier}层)后仍截断 (${fullResponse.length} chars)，设置 stop_reason=max_tokens`);
         }
 
         if (hasTools) {
@@ -945,69 +1046,132 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
         console.log(`[Handler] 非流式：重试响应 (${fullText.length} chars): ${fullText.substring(0, 200)}${fullText.length > 200 ? '...' : ''}`);
     }
 
-    // ★ 内部截断续写（与流式路径对齐）
-    // Claude CLI 使用非流式模式时，写大文件最容易被截断
-    // 在 proxy 内部完成续写，确保工具调用参数完整
-    const MAX_AUTO_CONTINUE = 6;
-    let continueCount = 0;
+    // ★ Thinking 提取：在截断检测之前提取，避免浪费 token 预算
+    const config = getConfig();
+    let thinkingBlocks: Array<{ thinking: string }> = [];
+    if (config.enableThinking && fullText.includes('<thinking>')) {
+        const extracted = extractThinking(fullText);
+        thinkingBlocks = extracted.thinkingBlocks;
+        fullText = extracted.cleanText;
+    }
+
+    // ★ 阶梯式截断恢复（与流式路径对齐）
+    // Tier 1: Bash/拆分引导  Tier 2: 强制拆分  Tier 3-4: 传统续写
     const originalMessages = [...activeCursorReq.messages];
+    let truncationTier = 0;
 
-    while (hasTools && isTruncated(fullText) && continueCount < MAX_AUTO_CONTINUE) {
-        continueCount++;
-        const prevLength = fullText.length;
-        console.log(`[Handler] ⚠️ 非流式：内部检测到截断 (${fullText.length} chars)，Proxy 将隐式请求无缝续写 (第${continueCount}次)...`);
+    while (hasTools && isTruncated(fullText) && truncationTier < 4) {
+        truncationTier++;
 
-        const anchorLength = Math.min(300, fullText.length);
-        const anchorText = fullText.slice(-anchorLength);
+        if (truncationTier <= 2) {
+            // ========== Tier 1 & 2: 工具策略引导 ==========
+            const isFirstTier = truncationTier === 1;
+            console.log(`[Handler] ⚠️ 非流式：检测到截断 (${fullText.length} chars)，执行 Tier ${truncationTier} 策略${isFirstTier ? '（Bash/拆分引导）' : '（强制拆分）'}...`);
 
-        const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
+            const tierPrompt = isFirstTier
+                ? `Output truncated (${fullText.length} chars). Split into smaller parts: use multiple Write calls (≤150 lines each) or Bash append (\`cat >> file << 'EOF'\`). Start with the first chunk now.`
+                : `Still truncated (${fullText.length} chars). Use ≤80 lines per action block. Start first chunk now.`;
 
-\`\`\`
-...${anchorText}
-\`\`\`
+            const tierReq: CursorChatRequest = {
+                ...activeCursorReq,
+                messages: [
+                    ...originalMessages,
+                    {
+                        parts: [{ type: 'text', text: fullText }],
+                        id: uuidv4(),
+                        role: 'assistant',
+                    },
+                    {
+                        parts: [{ type: 'text', text: tierPrompt }],
+                        id: uuidv4(),
+                        role: 'user',
+                    },
+                ],
+            };
 
-Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
+            const savedTruncatedText = fullText;
 
-        const continuationReq: CursorChatRequest = {
-            ...activeCursorReq,
-            messages: [
-                ...originalMessages,
-                {
-                    parts: [{ type: 'text', text: fullText }],
-                    id: uuidv4(),
-                    role: 'assistant',
-                },
-                {
-                    parts: [{ type: 'text', text: continuationPrompt }],
-                    id: uuidv4(),
-                    role: 'user',
-                },
-            ],
-        };
+            fullText = await sendCursorRequestFull(tierReq);
+            console.log(`[Handler] 非流式 Tier ${truncationTier} 响应 (${fullText.length} chars): ${fullText.substring(0, 200)}${fullText.length > 200 ? '...' : ''}`);
 
-        const continuationResponse = await sendCursorRequestFull(continuationReq);
+            // ★ 拒绝检测：如果 Tier 响应是拒绝或退化，恢复原始
+            if (isRefusal(fullText) || fullText.trim().length < savedTruncatedText.trim().length * 0.3) {
+                console.log(`[Handler] ⚠️ 非流式 Tier ${truncationTier} 响应为拒绝或退化，恢复原始截断响应`);
+                fullText = savedTruncatedText;
+                break;
+            }
 
-        if (continuationResponse.trim().length === 0) {
-            console.log(`[Handler] ⚠️ 非流式续写返回空响应，停止续写`);
-            break;
-        }
+            // 新响应也可能有 thinking
+            if (config.enableThinking && fullText.includes('<thinking>')) {
+                const extracted = extractThinking(fullText);
+                thinkingBlocks = [...thinkingBlocks, ...extracted.thinkingBlocks];
+                fullText = extracted.cleanText;
+            }
 
-        // ★ 智能去重
-        const deduped = deduplicateContinuation(fullText, continuationResponse);
-        fullText += deduped;
-        if (deduped.length !== continuationResponse.length) {
-            console.log(`[Handler] 非流式续写去重: 移除了 ${continuationResponse.length - deduped.length} chars 的重复内容`);
-        }
-        console.log(`[Handler] 非流式续写拼接完成: ${prevLength} → ${fullText.length} chars (+${deduped.length})`);
+            if (!isTruncated(fullText)) {
+                console.log(`[Handler] ✅ 非流式 Tier ${truncationTier} 策略成功，响应完整`);
+                break;
+            }
+        } else {
+            // ========== Tier 3 & 4: 传统续写（最后手段） ==========
+            const continueRound = truncationTier - 2;
+            const prevLength = fullText.length;
+            console.log(`[Handler] ⚠️ 非流式：降级到传统续写 (第${continueRound}次，共最多2次)...`);
 
-        // ★ 无进展检测：去重后没有新内容，停止续写
-        if (deduped.trim().length === 0) {
-            console.log(`[Handler] ⚠️ 非流式续写内容全部为重复，停止续写`);
-            break;
+            const anchorLength = Math.min(300, fullText.length);
+            const anchorText = fullText.slice(-anchorLength);
+
+            const continuationPrompt = `Output cut off. Last part:\n\`\`\`\n...${anchorText}\n\`\`\`\nContinue exactly from the cut-off point. No repeats.`;
+
+            const continuationReq: CursorChatRequest = {
+                ...activeCursorReq,
+                messages: [
+                    ...originalMessages,
+                    {
+                        parts: [{ type: 'text', text: fullText }],
+                        id: uuidv4(),
+                        role: 'assistant',
+                    },
+                    {
+                        parts: [{ type: 'text', text: continuationPrompt }],
+                        id: uuidv4(),
+                        role: 'user',
+                    },
+                ],
+            };
+
+            const continuationResponse = await sendCursorRequestFull(continuationReq);
+
+            if (continuationResponse.trim().length === 0) {
+                console.log(`[Handler] ⚠️ 非流式续写返回空响应，停止`);
+                break;
+            }
+
+            const deduped = deduplicateContinuation(fullText, continuationResponse);
+            fullText += deduped;
+            if (deduped.length !== continuationResponse.length) {
+                console.log(`[Handler] 非流式续写去重: 移除了 ${continuationResponse.length - deduped.length} chars 重复`);
+            }
+            console.log(`[Handler] 非流式续写拼接: ${prevLength} → ${fullText.length} chars (+${deduped.length})`);
+
+            if (deduped.trim().length === 0) {
+                console.log(`[Handler] ⚠️ 非流式续写内容全部为重复，停止`);
+                break;
+            }
         }
     }
 
     const contentBlocks: AnthropicContentBlock[] = [];
+
+    // 先添加 thinking content blocks
+    for (const tb of thinkingBlocks) {
+        contentBlocks.push({
+            type: 'thinking',
+            thinking: tb.thinking,
+            signature: 'cursor2api-thinking',
+        });
+    }
+
     // ★ 截断检测：代码块/XML 未闭合时，返回 max_tokens 让 Claude Code 自动继续
     let stopReason = (hasTools && isTruncated(fullText)) ? 'max_tokens' : 'end_turn';
     if (stopReason === 'max_tokens') {
@@ -1099,7 +1263,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         stop_reason: stopReason,
         stop_sequence: null,
         usage: { 
-            input_tokens: estimateInputTokens(body), 
+            ...estimateInputTokens(body), 
             output_tokens: Math.ceil(fullText.length / 3) 
         },
     };

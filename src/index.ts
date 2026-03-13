@@ -84,7 +84,7 @@ app.get('/', (_req, res) => {
 
 // ==================== 启动 ====================
 
-app.listen(config.port, () => {
+const server = app.listen(config.port, () => {
     console.log('');
     console.log('  ╔══════════════════════════════════════╗');
     console.log(`  ║        Cursor2API v${VERSION.padEnd(21)}║`);
@@ -106,3 +106,8 @@ app.listen(config.port, () => {
     console.log('  ╚══════════════════════════════════════╝');
     console.log('');
 });
+
+// 解除 Node.js HTTP Server 的默认超时限制，防止长时 AI 流式输出被本地掐断
+server.timeout = 0; 
+server.keepAliveTimeout = 120 * 1000;
+server.headersTimeout = 125 * 1000;

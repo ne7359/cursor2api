@@ -37,6 +37,7 @@ function getChromeHeaders(): Record<string, string> {
         'priority': 'u=1, i',
         'user-agent': config.fingerprint.userAgent,
         'x-is-human': '',  // Cursor 不再校验此字段
+        'anthropic-beta': 'max-tokens-3-5-sonnet-2024-07-15'
     };
 }
 

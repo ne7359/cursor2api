@@ -27,6 +27,7 @@ import type {
 import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converter.js';
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
 import { getConfig } from './config.js';
+import { extractThinking } from './thinking.js';
 import {
     isRefusal,
     sanitizeResponse,
@@ -410,6 +411,25 @@ async function handleOpenAIStream(
 
         let finishReason: 'stop' | 'tool_calls' = 'stop';
 
+        // ★ Thinking 提取：OpenAI 流式模式下提取 <thinking> 块并作为 reasoning_content 发送
+        const config = getConfig();
+        if (config.enableThinking && fullResponse.includes('<thinking>')) {
+            const extracted = extractThinking(fullResponse);
+            if (extracted.thinkingBlocks.length > 0) {
+                const reasoningContent = extracted.thinkingBlocks.map(b => b.thinking).join('\n\n');
+                fullResponse = extracted.cleanText;
+                // 发送 reasoning_content delta
+                writeOpenAISSE(res, {
+                    id, object: 'chat.completion.chunk', created, model,
+                    choices: [{
+                        index: 0,
+                        delta: { reasoning_content: reasoningContent },
+                        finish_reason: null,
+                    }],
+                });
+            }
+        }
+
         if (hasTools && hasToolCalls(fullResponse)) {
             const { toolCalls, cleanText } = parseToolCalls(fullResponse);
 
@@ -573,6 +593,17 @@ async function handleOpenAINonStream(
     let content: string | null = fullText;
     let toolCalls: OpenAIToolCall[] | undefined;
     let finishReason: 'stop' | 'tool_calls' = 'stop';
+    let reasoningContent: string | undefined;
+
+    // ★ Thinking 提取：OpenAI 非流式模式下提取 <thinking> 块
+    const config = getConfig();
+    if (config.enableThinking && fullText.includes('<thinking>')) {
+        const extracted = extractThinking(fullText);
+        if (extracted.thinkingBlocks.length > 0) {
+            reasoningContent = extracted.thinkingBlocks.map(b => b.thinking).join('\n\n');
+            fullText = extracted.cleanText;
+        }
+    }
 
     if (hasTools) {
         const parsed = parseToolCalls(fullText);
@@ -618,14 +649,16 @@ async function handleOpenAINonStream(
             message: {
                 role: 'assistant',
                 content,
+                ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
                 ...(toolCalls ? { tool_calls: toolCalls } : {}),
             },
             finish_reason: finishReason,
         }],
         usage: {
-            prompt_tokens: estimateInputTokens(anthropicReq),
+            prompt_tokens: estimateInputTokens(anthropicReq).input_tokens,
             completion_tokens: Math.ceil(fullText.length / 3),
-            total_tokens: estimateInputTokens(anthropicReq) + Math.ceil(fullText.length / 3),
+            total_tokens: estimateInputTokens(anthropicReq).input_tokens + Math.ceil(fullText.length / 3),
+            ...estimateInputTokens(anthropicReq) // Merge anthropic cache metrics for compatibility
         },
     };
 
