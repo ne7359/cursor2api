@@ -1,4 +1,4 @@
-# Cursor2API v2.6.2
+# Cursor2API v2.6.3
 
 将 Cursor 文档页免费 AI 对话接口代理转换为 **Anthropic Messages API** 和 **OpenAI Chat Completions API**，支持 **Claude Code** 和 **Cursor IDE** 使用。
 
@@ -163,6 +163,25 @@ AI 按此格式输出 → 我们解析并转换为标准的 Anthropic `tool_use`
 | **L4: 响应清洗** | `handler.ts` | `sanitizeResponse()` 对所有输出做后处理，将 Cursor 身份引用替换为 Claude |
 
 ## 更新日志
+
+### v2.6.3 (2026-03-15) — 客户端 Thinking 协议支持 + 实时流式输出 + Thinking 提示词增强
+
+**🧠 客户端 Thinking 协议完整支持**
+- 新增 `thinking` 字段解析：支持 Anthropic API 标准的 `thinking.type: 'enabled' | 'disabled'` 和 `budget_tokens` 参数
+- 统一 thinking 启用逻辑：客户端显式 `enabled` > 服务端 `enableThinking` 配置 > 默认关闭
+- 工具模式下客户端明确开启 thinking 时保留（而非一律剥离），尊重客户端意图
+- Anthropic / OpenAI / 流式 / 非流式四条路径全部对齐新逻辑
+
+**⚡ 实时流式输出（替代缓冲后统一发送）**
+- 非工具模式：SSE 接收数据时实时流式发送给客户端，不再等待完整响应后才输出
+- 新增 `sentText` 跟踪机制：后处理阶段仅发送未发送的增量部分，彻底消除重复内容
+- Thinking 内联流式：客户端显式开启 thinking 时，`<thinking>` 块在流中实时发送为 thinking content block
+- 新增 `thinkingSent` 标志：已在流中发送的 thinking 跳过后处理，避免重复
+
+**📝 Thinking 提示词增强**
+- THINKING_HINT 从简短的 "keep under 3 lines" 升级为强制性指令
+- 新提示词要求模型在响应前必须使用 `<thinking>` 标签进行推理分析
+- 明确告知 thinking 内容不会展示给用户，鼓励充分思考
 
 ### v2.6.2 (2026-03-14) — 动态工具结果预算 + 工具指令瘦身 + Thinking 简化
 

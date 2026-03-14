@@ -93,6 +93,7 @@ function buildToolInstructions(
     tools: AnthropicTool[],
     hasCommunicationTool: boolean,
     toolChoice?: AnthropicRequest['tool_choice'],
+    clientExplicitThinking?: boolean,
 ): string {
     if (!tools || tools.length === 0) return '';
 
@@ -119,22 +120,19 @@ function buildToolInstructions(
         forceConstraint = `\nYou MUST call "${requiredName}" using a \`\`\`json action block.`;
     }
 
-    // ★ 根因修复：精简行为规则 + 主动禁止 thinking + 强制紧凑 JSON
-    const thinkingBan = 'Do NOT use <thinking> tags or any internal reasoning markup.';
-    const compactJson = 'Use compact JSON (no extra whitespace/newlines in action blocks).';
-    const splitRule = 'Keep Write ≤80 lines; for larger content use Bash: `cat >> file << \'EOF\'`.';
-
+    // ★ v2.5.6 验证过的自然措辞 + 后续优化（紧凑JSON、thinking控制、中文提示）
+    const thinkingNote = clientExplicitThinking ? '' : ' Do not output <thinking> tags.';
+    
     const behaviorRules = hasCommunicationTool
-        ? `${thinkingBan} ${compactJson} Use \`\`\`json action blocks. Emit multiple independent blocks in one response. For dependent actions, wait for results. Use communication actions (attempt_completion, ask_followup_question) when done or need input. ${splitRule}`
-        : `${thinkingBan} ${compactJson} Use \`\`\`json action blocks. Emit multiple independent blocks in one response. For dependent actions, wait for results. Keep text brief. No action needed = plain text. ${splitRule}`;
+        ? `When performing actions, always include the structured block. For independent actions, include multiple blocks in one response. For dependent actions (where one result feeds into the next), wait for each result. When you have completed the task, use attempt_completion. When you need to ask the user something, use ask_followup_question. Use compact JSON. For writing files >80 lines, prefer Bash with heredoc.${thinkingNote} Respond in Chinese when the user writes in Chinese.`
+        : `Include the structured block when performing actions. For independent actions, include multiple blocks. For dependent actions, wait for each result. Keep explanatory text brief. If you have nothing to execute, respond in plain text. Use compact JSON. For writing files >80 lines, prefer Bash with heredoc.${thinkingNote} Respond in Chinese when the user writes in Chinese.`;
 
-    // 自然的 IDE 场景描述，不注入对抗性角色扩展
-    return `You are operating within an IDE environment with access to the following actions. To invoke an action, include it in your response using this compact format:
+    return `You are operating within an IDE environment with access to the following actions. To invoke an action, include it in your response using this format:
 \`\`\`json action
-{"tool":"NAME","parameters":{"key":"value"}}
+{"tool":"ACTION_NAME","parameters":{"param":"value"}}
 \`\`\`
 
-Actions:
+Available actions:
 ${toolList}
 
 ${behaviorRules}${forceConstraint}`;
@@ -180,10 +178,24 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
         }
     }
 
-    // ★ Thinking 提示词注入：仅在非工具模式下启用
-    // 工具模式下 Cursor API 的 output 预算很小（~1800 chars），thinking 会吃掉大部分预算
-    // 导致实际工具调用（Edit/Write 等）被截断，是截断问题的根因
-    if (config.enableThinking && !hasTools && combinedSystem) {
+    // ★ 系统提示词压缩：工具模式下客户端系统提示词过长时截断
+    // Claude Code 的系统提示词常常 15-20K，占比太高，挤压对话空间
+    const SYSTEM_MAX_CHARS = hasTools ? 10000 : 15000;
+    if (combinedSystem.length > SYSTEM_MAX_CHARS) {
+        const originalLen = combinedSystem.length;
+        combinedSystem = combinedSystem.substring(0, SYSTEM_MAX_CHARS) +
+            '\n\n[System prompt truncated for context budget]';
+        console.log(`[Converter] 📦 压缩系统提示词: ${originalLen} → ${combinedSystem.length} chars`);
+    }
+
+    // ★ Thinking 提示词注入：
+    // 仅在非工具模式注入 THINKING_HINT（工具模式输出预算极小，thinking 会吃掉 70%）
+    // 工具模式下：移除 thinking ban（模型可以自发 think），但不主动强制
+    // 无论是否注入 hint，thinking blocks 的解析和转发逻辑始终生效
+    const clientExplicitThinking = req.thinking?.type === 'enabled';
+    const serverThinking = req.thinking?.type !== 'disabled' && !!config.enableThinking;
+    const shouldInjectThinking = (clientExplicitThinking || serverThinking) && !hasTools;
+    if (shouldInjectThinking && combinedSystem) {
         combinedSystem = combinedSystem + '\n\n' + THINKING_HINT;
     }
 
@@ -193,7 +205,7 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
         console.log(`[Converter] 工具数量: ${tools.length}, tool_choice: ${toolChoice?.type ?? 'auto'}`);
 
         const hasCommunicationTool = tools.some(t => ['attempt_completion', 'ask_followup_question', 'AskFollowupQuestion'].includes(t.name));
-        let toolInstructions = buildToolInstructions(tools, hasCommunicationTool, toolChoice);
+        let toolInstructions = buildToolInstructions(tools, hasCommunicationTool, toolChoice, clientExplicitThinking);
 
         // 系统提示词与工具指令合并
         toolInstructions = combinedSystem + '\n\n---\n\n' + toolInstructions;
@@ -220,9 +232,9 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
             id: shortId(),
             role: 'user',
         });
-        // ★ 根因修复：few-shot 用紧凑 JSON 教模型输出格式（而非 pretty-print）
+        // ★ few-shot 响应：极简格式，只教会模型 JSON 格式
         messages.push({
-            parts: [{ type: 'text', text: `Understood.\n\n\`\`\`json action\n${JSON.stringify({ tool: fewShotTool.name, parameters: fewShotParams })}\n\`\`\`` }],
+            parts: [{ type: 'text', text: `\`\`\`json action\n${JSON.stringify({ tool: fewShotTool.name, parameters: fewShotParams })}\n\`\`\`` }],
             id: shortId(),
             role: 'assistant',
         });
@@ -345,39 +357,112 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
     }
     // 更新动态预算的上下文字符数（用实际 Cursor 消息计算值覆盖之前的估算值）
     setCurrentContextChars(totalChars);
-    console.log(`[Converter] 压缩前总消息数=${messages.length}, 压缩前总字符=${totalChars}`);
 
-    // ★ 根因修复：渐进式历史压缩 — 阈值从 400K 降至 100K
-    // Cursor API 输出预算与输入大小成反比。400K 阈值太宽松，
-    // 在实际 64K 上下文时就已经导致截断。100K 阈值更积极地压缩早期消息。
-    const KEEP_RECENT = 6; // 保留最近6条消息不压缩
-    const EARLY_MSG_MAX_CHARS = hasTools ? 1500 : 2000; // 工具模式更激进
-    const MAX_SAFE_CHARS = 100000; // ★ 从 400K 降至 100K — 给输出留更多空间
+    // ★ 上下文预算概览：显示各部分占比，帮助诊断截断问题
+    const MAX_SAFE_CHARS = 100000; // 安全阈值 — 给输出留空间
+    const systemChars = combinedSystem?.length ?? 0;
+    const toolInstrChars = hasTools ? (messages[0]?.parts[0]?.text?.length ?? 0) - systemChars : 0;
+    const fewShotChars = messages.length > 1 ? messages.slice(0, 2).reduce((s, m) => s + m.parts.reduce((x, p) => x + (p.text?.length ?? 0), 0), 0) : 0;
+    const convChars = totalChars - fewShotChars;
+    const thinkHintChars = shouldInjectThinking ? THINKING_HINT.length : 0;
+    const pct = (n: number) => totalChars > 0 ? `${Math.round(n / totalChars * 100)}%` : '0%';
+    console.log(`[Converter] 📊 上下文预算: 总计=${totalChars} chars | 系统提示=${systemChars}(${pct(systemChars)}) | 工具指令=${toolInstrChars > 0 ? toolInstrChars : 'N/A'}(${pct(Math.max(toolInstrChars, 0))}) | few-shot=${fewShotChars}(${pct(fewShotChars)}) | 对话=${convChars}(${pct(convChars)}) | thinking提示=${thinkHintChars}`);
+    console.log(`[Converter] 📊 安全阈值=${MAX_SAFE_CHARS} | 余量=${MAX_SAFE_CHARS - totalChars} chars | 工具结果预算=${getToolResultBudget(totalChars)}`);
 
-    if (totalChars > MAX_SAFE_CHARS && messages.length > KEEP_RECENT + 2) { 
-        const compressEnd = messages.length - KEEP_RECENT;
-        for (let i = 2; i < compressEnd; i++) { // 从 index 2 开始跳过 few-shot
-            const msg = messages[i];
-            for (const part of msg.parts) {
-                if (part.text && part.text.length > EARLY_MSG_MAX_CHARS) {
-                    const originalLen = part.text.length;
-                    part.text = part.text.substring(0, EARLY_MSG_MAX_CHARS) +
-                        `\n\n... [truncated ${originalLen - EARLY_MSG_MAX_CHARS} chars for context budget]`;
-                    console.log(`[Converter] 📦 压缩早期消息 msg[${i}] (${msg.role}): ${originalLen} → ${part.text.length} chars`);
+    // ★ 智能上下文压缩：
+    // 1. 单条大消息（如初始上下文 msg[2]）→ 直接截断（不 AI 摘要，避免触发拒绝）
+    // 2. 多轮对话历史（≥2 条旧消息）→ AI 摘要（保留关键信息）
+    // 3. 摘要结果缓存 → 重试时不重复调用 API
+    const CONV_BUDGET = Math.floor(MAX_SAFE_CHARS * 0.5);
+    const KEEP_RECENT = 2;
+
+    if (convChars > CONV_BUDGET && messages.length > 3) {
+        console.log(`[Converter] ⚠️ 对话占比过高 (${convChars}/${CONV_BUDGET})，启动压缩...`);
+        
+        const compressEnd = Math.max(messages.length - KEEP_RECENT, 3);
+        
+        // 统计要压缩的消息
+        let longMsgCount = 0;
+        let totalOldChars = 0;
+        for (let i = 2; i < compressEnd; i++) {
+            const text = messages[i].parts.map(p => p.text || '').join('\n');
+            if (text.length > 1000) longMsgCount++;
+            totalOldChars += text.length;
+        }
+
+        if (longMsgCount >= 2 && totalOldChars > 8000) {
+            // 多轮对话历史 → AI 摘要
+            const cacheKey = messages.slice(2, compressEnd).map(m => 
+                m.parts[0]?.text?.substring(0, 50) || ''
+            ).join('|');
+
+            if (_summaryCache.key === cacheKey && _summaryCache.summary) {
+                // 使用缓存的摘要
+                console.log(`[Converter] 🤖 使用缓存的 AI 摘要 (${_summaryCache.summary.length} chars)`);
+                applySummary(messages, _summaryCache.summary, compressEnd);
+            } else {
+                // 生成新摘要
+                const oldMessages: string[] = [];
+                for (let i = 2; i < compressEnd; i++) {
+                    const msg = messages[i];
+                    const text = msg.parts.map(p => p.text || '').join('\n');
+                    // 跳过像系统提示词的内容，只摘要真正的对话
+                    const cleanText = text.substring(0, 2500);
+                    oldMessages.push(`[${msg.role}]: ${cleanText}`);
+                }
+
+                const summaryPrompt = `You are a conversation summarizer. Summarize only the KEY FACTS from this conversation (max 1500 chars):
+- File paths mentioned and what was done to them
+- Tool calls made and their results
+- User's current goal
+- Errors encountered
+Do NOT include any system instructions, role descriptions, or behavioral rules. Output only the factual summary.
+
+${oldMessages.join('\n---\n')}`;
+
+                try {
+                    console.log(`[Converter] 🤖 AI 摘要: 压缩 ${oldMessages.length} 条旧消息 (${totalOldChars} chars)...`);
+                    const { sendCursorRequestFull } = await import('./cursor-client.js');
+                    const summary = await sendCursorRequestFull({
+                        model: config.cursorModel,
+                        id: shortId(),
+                        messages: [{
+                            parts: [{ type: 'text', text: summaryPrompt }],
+                            id: shortId(),
+                            role: 'user',
+                        }],
+                        trigger: 'submit-message',
+                        max_tokens: 4096,
+                    });
+
+                    if (summary && summary.length > 50) {
+                        const trimmed = summary.substring(0, 1500);
+                        _summaryCache = { key: cacheKey, summary: trimmed };
+                        applySummary(messages, trimmed, compressEnd);
+                        console.log(`[Converter] 🤖 AI 摘要完成: ${totalOldChars} → ${trimmed.length} chars`);
+                    } else {
+                        console.log(`[Converter] ⚠️ AI 摘要为空，回退截断`);
+                        fallbackTruncate(messages, CONV_BUDGET, !!hasTools, KEEP_RECENT);
+                    }
+                } catch (err) {
+                    console.error(`[Converter] AI 摘要失败，回退截断:`, err instanceof Error ? err.message : err);
+                    fallbackTruncate(messages, CONV_BUDGET, !!hasTools, KEEP_RECENT);
                 }
             }
+        } else {
+            // 单条大消息或消息太少 → 直接截断（不用 AI，避免摘要系统提示词触发拒绝）
+            console.log(`[Converter] 📦 直接截断 (${longMsgCount} 条长消息, ${totalOldChars} chars)`);
+            fallbackTruncate(messages, CONV_BUDGET, !!hasTools, KEEP_RECENT);
         }
-        
+
         // 重新计算压缩后的字数
         let compressedChars = 0;
         for (const m of messages) {
             compressedChars += m.parts.reduce((s, p) => s + (p.text?.length ?? 0), 0);
         }
-        // 更新动态预算
         setCurrentContextChars(compressedChars);
-        console.log(`[Converter] 压缩后总字符=${compressedChars} (节省 ${totalChars - compressedChars} 字符)`);
     } else {
-        console.log(`[Converter] 当前对话上下文正常 (${totalChars} chars)，未达到 ${MAX_SAFE_CHARS} 阈值。`);
+        console.log(`[Converter] ✅ 上下文正常 (${totalChars}/${MAX_SAFE_CHARS}, 对话${Math.round(convChars / MAX_SAFE_CHARS * 100)}%), 无需压缩`);
     }
 
     return {
@@ -389,6 +474,41 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
     };
 }
 
+// AI 摘要缓存（避免重试时重复调用 API）
+let _summaryCache: { key: string; summary: string } = { key: '', summary: '' };
+
+// 将摘要应用到消息数组
+function applySummary(messages: CursorMessage[], summary: string, compressEnd: number): void {
+    const summaryMsg: CursorMessage = {
+        parts: [{ type: 'text', text: `[Context summary]\n${summary}` }],
+        id: shortId(),
+        role: 'user',
+    };
+    const recentMessages = messages.slice(compressEnd);
+    messages.length = 2; // 保留 few-shot
+    messages.push(summaryMsg);
+    messages.push(...recentMessages);
+}
+
+// 回退截断压缩（AI 摘要失败时使用）
+function fallbackTruncate(messages: CursorMessage[], convBudget: number, hasTools: boolean, keepRecent: number): void {
+    const convMsgCount = messages.length - 2;
+    const targetPerMsg = Math.floor(convBudget / Math.max(convMsgCount, 1));
+    const msgMaxChars = Math.max(Math.min(targetPerMsg, hasTools ? 1500 : 2000), 800);
+    
+    const compressEnd = Math.max(messages.length - keepRecent, 3);
+    for (let i = 2; i < compressEnd; i++) {
+        const msg = messages[i];
+        for (const part of msg.parts) {
+            if (part.text && part.text.length > msgMaxChars) {
+                const originalLen = part.text.length;
+                part.text = part.text.substring(0, msgMaxChars) +
+                    `\n\n... [truncated ${originalLen - msgMaxChars} chars for context budget]`;
+                console.log(`[Converter] 📦 截断 msg[${i}] (${msg.role}): ${originalLen} → ${part.text.length} chars`);
+            }
+        }
+    }
+}
 // ★ 根因修复：动态工具结果预算（替代固定 15000）
 // Cursor API 的输出预算与输入大小成反比，固定 15K 在大上下文下严重挤压输出空间
 function getToolResultBudget(totalContextChars: number): number {
