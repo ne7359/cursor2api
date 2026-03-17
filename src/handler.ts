@@ -396,7 +396,13 @@ export function sanitizeResponse(text: string): string {
     result = result.replace(/\*\*`?read_dir`?\*\*[^\n]*\n(?:[^\n]*\n){0,3}/gi, '');
     result = result.replace(/\d+\.\s*\*\*`?read_(?:file|dir)`?\*\*[^\n]*/gi, '');
     result = result.replace(/[⚠注意].*?(?:不是|并非|无法).*?(?:本地文件|代码库|执行代码)[^。\n]*[。]?\s*/g, '');
-
+    // === Hallucination about accidentally calling Cursor internal tools ===
+    // "I accidentally called the Cursor documentation read_dir tool." -> remove entire sentence
+    result = result.replace(/[^\n.!?]*(?:accidentally|mistakenly|keep|sorry|apologies|apologize)[^\n.!?]*(?:called|calling|used|using)[^\n.!?]*Cursor[^\n.!?]*tool[^\n.!?]*[.!?]\s*/gi, '');
+    result = result.replace(/[^\n.!?]*Cursor\s+documentation[^\n.!?]*tool[^\n.!?]*[.!?]\s*/gi, '');
+    // Sometimes it follows up with "I need to stop this." -> remove if preceding tool hallucination
+    result = result.replace(/I\s+need\s+to\s+stop\s+this[.!]\s*/gi, '');
+    
     return result;
 }
 
@@ -747,7 +753,7 @@ async function handleDirectTextStream(
         let rawResponse = '';
         let visibleText = '';
         let leadingBuffer = '';
-        let leadingResolved = !clientRequestedThinking;
+        let leadingResolved = false;
         let thinkingContent = '';
         const attemptStreamer = createIncrementalTextStreamer({
             transform: sanitizeResponse,
@@ -782,11 +788,9 @@ async function handleDirectTextStream(
 
             rawResponse += event.delta;
 
-            if (!clientRequestedThinking) {
-                flushVisible(event.delta);
-                return;
-            }
-
+            // ★ 始终缓冲前导内容以检测并剥离 <thinking> 标签
+            // 无论 clientRequestedThinking 是否为 true，都需要分离 thinking
+            // 区别在于：true 时发送 thinking content block，false 时静默丢弃 thinking 标签
             if (!leadingResolved) {
                 leadingBuffer += event.delta;
                 const split = splitLeadingThinkingBlocks(leadingBuffer);
@@ -800,6 +804,12 @@ async function handleDirectTextStream(
                     return;
                 }
 
+                // 没有以 <thinking> 开头：检查缓冲区是否足够判断
+                // 如果缓冲区还很短（< "<thinking>".length），继续等待
+                if (leadingBuffer.trimStart().length < THINKING_OPEN.length) {
+                    return;
+                }
+
                 leadingResolved = true;
                 const buffered = leadingBuffer;
                 leadingBuffer = '';
@@ -809,6 +819,21 @@ async function handleDirectTextStream(
 
             flushVisible(event.delta);
         });
+
+        // ★ 流结束后 flush 残留的 leadingBuffer
+        // 极短响应可能在 leadingBuffer 中有未发送的内容
+        if (!leadingResolved && leadingBuffer) {
+            leadingResolved = true;
+            // 再次尝试分离 thinking（完整响应可能包含完整的 thinking 块）
+            const split = splitLeadingThinkingBlocks(leadingBuffer);
+            if (split.startedWithThinking && split.complete) {
+                thinkingContent = split.thinkingContent;
+                flushVisible(split.remainder);
+            } else {
+                flushVisible(leadingBuffer);
+            }
+            leadingBuffer = '';
+        }
 
         if (firstChunk) {
             log.endPhase();
@@ -820,7 +845,7 @@ async function handleDirectTextStream(
 
         return {
             rawResponse,
-            visibleText: clientRequestedThinking ? visibleText : rawResponse,
+            visibleText,
             thinkingContent,
             streamer: attemptStreamer,
         };
@@ -833,14 +858,11 @@ async function handleDirectTextStream(
         finalThinkingContent = attempt.thinkingContent;
         streamer = attempt.streamer;
 
-        const textForRefusalCheck = clientRequestedThinking
-            ? finalVisibleText
-            : stripThinkingTags(finalRawResponse);
-
-        if (!streamer.hasSentText() && isRefusal(textForRefusalCheck) && retryCount < MAX_REFUSAL_RETRIES) {
+        // visibleText 始终是剥离 thinking 后的文本，可直接用于拒绝检测
+        if (!streamer.hasSentText() && isRefusal(finalVisibleText) && retryCount < MAX_REFUSAL_RETRIES) {
             retryCount++;
             log.warn('Handler', 'retry', `检测到拒绝（第${retryCount}次），自动重试`, {
-                preview: textForRefusalCheck.substring(0, 200),
+                preview: finalVisibleText.substring(0, 200),
             });
             log.updateSummary({ retryCount });
             const retryBody = buildRetryRequest(body, retryCount - 1);
@@ -867,16 +889,12 @@ async function handleDirectTextStream(
     if (finalThinkingContent) {
         log.recordThinking(finalThinkingContent);
         log.updateSummary({ thinkingChars: finalThinkingContent.length });
-        if (clientRequestedThinking) {
-            log.info('Handler', 'thinking', `剥离 thinking → content block: ${finalThinkingContent.length} chars, 剩余 ${finalVisibleText.length} chars`);
-        } else {
-            log.info('Handler', 'thinking', `保留 thinking 在正文中 (非客户端请求): ${finalThinkingContent.length} chars`);
-        }
+        log.info('Handler', 'thinking', `剥离 thinking: ${finalThinkingContent.length} chars, 剩余正文 ${finalVisibleText.length} chars, clientRequested=${clientRequestedThinking}`);
     }
 
     let finalTextToSend: string;
-    const refusalText = clientRequestedThinking ? finalVisibleText : stripThinkingTags(finalRawResponse);
-    const usedFallback = !streamer.hasSentText() && isRefusal(refusalText);
+    // visibleText 现在始终是剥离 thinking 后的文本
+    const usedFallback = !streamer.hasSentText() && isRefusal(finalVisibleText);
     if (usedFallback) {
         if (isToolCapabilityQuestion(body)) {
             log.info('Handler', 'refusal', '工具能力询问被拒绝 → 返回 Claude 能力描述');
@@ -911,7 +929,7 @@ async function handleDirectTextStream(
     writeSSE(res, 'message_stop', { type: 'message_stop' });
 
     const finalRecordedResponse = streamer.hasSentText()
-        ? sanitizeResponse(clientRequestedThinking ? finalVisibleText : finalRawResponse)
+        ? sanitizeResponse(finalVisibleText)
         : finalTextToSend;
     log.recordFinalResponse(finalRecordedResponse);
     log.complete(finalRecordedResponse.length, 'end_turn');
@@ -1003,36 +1021,27 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         });
 
         // ★ Thinking 提取（在拒绝检测之前，防止 thinking 内容触发 isRefusal 误判）
+        // 始终剥离 thinking 标签，避免泄漏到最终文本中
         let thinkingContent = '';
         if (fullResponse.includes('<thinking>')) {
             const { thinkingContent: extracted, strippedText } = extractThinking(fullResponse);
             if (extracted) {
                 thinkingContent = extracted;
+                fullResponse = strippedText;
                 log.recordThinking(thinkingContent);
                 log.updateSummary({ thinkingChars: thinkingContent.length });
                 if (clientRequestedThinking) {
-                    // 客户端原生请求 thinking → 剥离标签，稍后发送 thinking content block
-                    fullResponse = strippedText;
                     log.info('Handler', 'thinking', `剥离 thinking → content block: ${thinkingContent.length} chars, 剩余 ${fullResponse.length} chars`);
                 } else {
-                    // proxy 注入的 thinking → 保留标签在正文中，Claude Code 可直接显示
-                    log.info('Handler', 'thinking', `保留 thinking 在正文中 (非客户端请求): ${thinkingContent.length} chars`);
+                    log.info('Handler', 'thinking', `剥离 thinking (非客户端请求): ${thinkingContent.length} chars, 剩余 ${fullResponse.length} chars`);
                 }
             }
         }
 
-        // 拒绝检测 + 自动重试（工具模式和非工具模式均生效）
-        // ★ 关键：拒绝检测必须在 thinking-stripped 文本上进行
-        // 否则 thinking 中的反思性语言（如 "haven't given a specific task"）会触发误判
-        const getTextForRefusalCheck = () => {
-            if (fullResponse.includes('<thinking>')) {
-                return extractThinking(fullResponse).strippedText;
-            }
-            return fullResponse;
-        };
+        // 拒绝检测 + 自动重试
+        // fullResponse 已在上方剥离 thinking 标签，可直接用于拒绝检测
         const shouldRetryRefusal = () => {
-            const textToCheck = getTextForRefusalCheck();
-            if (!isRefusal(textToCheck)) return false;
+            if (!isRefusal(fullResponse)) return false;
             if (hasTools && hasToolCalls(fullResponse)) return false;
             return true;
         };
@@ -1044,6 +1053,14 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
             const retryBody = buildRetryRequest(body, retryCount - 1);
             activeCursorReq = await convertToCursorRequest(retryBody);
             await executeStream();
+            // 重试后也需要剥离 thinking 标签
+            if (fullResponse.includes('<thinking>')) {
+                const { thinkingContent: retryThinking, strippedText: retryStripped } = extractThinking(fullResponse);
+                if (retryThinking) {
+                    thinkingContent = retryThinking;
+                    fullResponse = retryStripped;
+                }
+            }
             log.info('Handler', 'retry', `重试响应: ${fullResponse.length} chars`, { preview: fullResponse.substring(0, 200) });
         }
 
@@ -1294,12 +1311,10 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
                 let textToSend = fullResponse;
 
                 // ★ 仅对短响应或开头明确匹配拒绝模式的响应进行压制
-                // 长响应（如模型在写报告）中可能碰巧包含某个宽泛的拒绝关键词，不应被误判
-                // 截断响应（stopReason=max_tokens）一定不是拒绝
-                const strippedResponse = getTextForRefusalCheck();
-                const isShortResponse = strippedResponse.trim().length < 500;
-                const startsWithRefusal = isRefusal(strippedResponse.substring(0, 300));
-                const isActualRefusal = stopReason !== 'max_tokens' && (isShortResponse ? isRefusal(strippedResponse) : startsWithRefusal);
+                // fullResponse 已被剥离 thinking 标签
+                const isShortResponse = fullResponse.trim().length < 500;
+                const startsWithRefusal = isRefusal(fullResponse.substring(0, 300));
+                const isActualRefusal = stopReason !== 'max_tokens' && (isShortResponse ? isRefusal(fullResponse) : startsWithRefusal);
 
                 if (isActualRefusal) {
                     log.info('Handler', 'sanitize', `抑制无工具的完整拒绝响应`, { preview: fullResponse.substring(0, 200) });
@@ -1407,31 +1422,25 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     });
 
     // ★ Thinking 提取（在拒绝检测之前）
+    // 始终剥离 thinking 标签，避免泄漏到最终文本中
     let thinkingContent = '';
     if (fullText.includes('<thinking>')) {
         const { thinkingContent: extracted, strippedText } = extractThinking(fullText);
         if (extracted) {
             thinkingContent = extracted;
+            fullText = strippedText;
             if (clientRequestedThinking) {
-                fullText = strippedText;
                 log.info('Handler', 'thinking', `非流式剥离 thinking → content block: ${thinkingContent.length} chars, 剩余 ${fullText.length} chars`);
             } else {
-                log.info('Handler', 'thinking', `非流式保留 thinking 在正文中: ${thinkingContent.length} chars`);
+                log.info('Handler', 'thinking', `非流式剥离 thinking (非客户端请求): ${thinkingContent.length} chars, 剩余 ${fullText.length} chars`);
             }
         }
     }
 
-    // 拒绝检测 + 自动重试（工具模式和非工具模式均生效）
-    // ★ 关键：拒绝检测必须在 thinking-stripped 文本上进行
-    const getTextForRefusalCheck = () => {
-        if (fullText.includes('<thinking>')) {
-            return extractThinking(fullText).strippedText;
-        }
-        return fullText;
-    };
+    // 拒绝检测 + 自动重试
+    // fullText 已在上方剥离 thinking 标签，可直接用于拒绝检测
     const shouldRetry = () => {
-        const textToCheck = getTextForRefusalCheck();
-        return isRefusal(textToCheck) && !(hasTools && hasToolCalls(fullText));
+        return isRefusal(fullText) && !(hasTools && hasToolCalls(fullText));
     };
 
     if (shouldRetry()) {
@@ -1442,6 +1451,14 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
             const retryBody = buildRetryRequest(body, attempt);
             activeCursorReq = await convertToCursorRequest(retryBody);
             fullText = await sendCursorRequestFull(activeCursorReq);
+            // 重试后也需要剥离 thinking 标签
+            if (fullText.includes('<thinking>')) {
+                const { thinkingContent: retryThinking, strippedText: retryStripped } = extractThinking(fullText);
+                if (retryThinking) {
+                    thinkingContent = retryThinking;
+                    fullText = retryStripped;
+                }
+            }
             if (!shouldRetry()) break;
         }
         if (shouldRetry()) {
@@ -1623,10 +1640,10 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         } else {
             let textToSend = fullText;
             // ★ 同样仅对短响应或开头匹配的进行拒绝压制
-            const strippedText = getTextForRefusalCheck();
-            const isShort = strippedText.trim().length < 500;
-            const startsRefusal = isRefusal(strippedText.substring(0, 300));
-            const isRealRefusal = stopReason !== 'max_tokens' && (isShort ? isRefusal(strippedText) : startsRefusal);
+            // fullText 已被剥离 thinking 标签
+            const isShort = fullText.trim().length < 500;
+            const startsRefusal = isRefusal(fullText.substring(0, 300));
+            const isRealRefusal = stopReason !== 'max_tokens' && (isShort ? isRefusal(fullText) : startsRefusal);
             if (isRealRefusal) {
                 log.info('Handler', 'sanitize', `非流式抑制纯文本拒绝响应`, { preview: fullText.substring(0, 200) });
                 textToSend = 'Let me proceed with the task.';
