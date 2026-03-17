@@ -1,4 +1,5 @@
 # Cursor2API v2 配置文件
+# 复制此文件为 config.yaml 并根据需要修改
 
 # 服务端口
 port: 3010
@@ -87,7 +88,7 @@ vision:
 # 环境变量: LOG_FILE_ENABLED=true|false, LOG_DIR=./logs
 logging:
   # 是否启用日志文件持久化（默认关闭）
-  file_enabled: true
+  file_enabled: false
   # 日志文件存储目录
   dir: "./logs"
   # 日志保留天数（超过天数的日志文件会自动清理）

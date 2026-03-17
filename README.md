@@ -26,6 +26,7 @@
 - **Anthropic Messages API 完整兼容** - `/v1/messages` 流式/非流式，直接对接 Claude Code
 - **OpenAI Chat Completions API 兼容** - `/v1/chat/completions`，对接 ChatBox / LobeChat 等客户端
 - **Cursor IDE Agent 模式适配** - `/v1/responses` 端点 + 扁平工具格式 + 增量流式工具调用
+- **🆕 全链路日志查看器** - Web UI 实时查看请求/响应/工具调用全流程，支持日/夜主题切换
 - **🆕 API Token 鉴权** - 公网部署安全，支持 Bearer token / x-api-key 双模式，多 token 管理
 - **🆕 Thinking 支持** - 客户端驱动，Anthropic `thinking` block + OpenAI `reasoning_content`，模型名含 `thinking` 或传 `reasoning_effort` 即启用
 - **🆕 response_format 支持** - `json_object` / `json_schema` 格式输出，自动剥离 markdown 包装
@@ -57,26 +58,54 @@ npm install
 
 ### 2. 配置
 
-编辑 `config.yaml`：
-- `auth_tokens` - API 鉴权 token 列表（公网部署推荐配置，不配则全部放行）
-- `cursor_model` - 使用的模型（默认 `anthropic/claude-sonnet-4.6`）
-- `compression.enabled` - 压缩开关（默认开启）
-- `compression.level` - 压缩级别 1-3（1=轻度, 2=中等, 3=激进）
-- `proxy` - 全局代理（可选，国内通常不需要）
-- `vision.enabled` - 开启视觉拦截
-- `vision.mode` - 视觉模式：`ocr`（免 Key）或 `api`（外接视觉模型）
-- `vision.proxy` - Vision 独立代理（不影响主请求速度）
+复制示例配置文件并根据需要修改：
+
+```bash
+cp config.yaml.example config.yaml
+```
+
+主要配置项：
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `port` | 服务端口 | `3010` |
+| `auth_tokens` | API 鉴权 token 列表（公网部署推荐配置） | 不配置则全部放行 |
+| `cursor_model` | 使用的模型 | `anthropic/claude-sonnet-4.6` |
+| `thinking.enabled` | Thinking 开关（最高优先级） | `true` |
+| `compression.enabled` | 压缩开关 | `true` |
+| `compression.level` | 压缩级别 1-3 | `2` (中等) |
+| `proxy` | 全局代理（可选） | 不配置 |
+| `vision.enabled` | 开启视觉拦截 | `true` |
+| `vision.mode` | 视觉模式：`ocr` / `api` | `ocr` |
+| `vision.proxy` | Vision 独立代理 | 不配置 |
+| `logging.file_enabled` | 日志文件持久化 | `false` |
+| `logging.dir` | 日志存储目录 | `./logs` |
+| `logging.max_days` | 日志保留天数 | `7` |
+
+> 💡 详细配置说明请参见 `config.yaml.example` 中的注释。
 
 ### 3. 启动
 
 ```bash
+# 开发模式
 npm run dev
+
+# 生产模式
+npm run build && npm start
 ```
 
 ### 4. 配合 Claude Code 使用
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:3010
+claude
+```
+
+如果配置了 `auth_tokens`，需要同时设置 API Key：
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:3010
+export ANTHROPIC_API_KEY=sk-your-secret-token-1
 claude
 ```
 
@@ -89,6 +118,29 @@ OPENAI_BASE_URL=http://localhost:3010/v1
 模型选择 `claude-sonnet-4-20250514` 或其他列出的 Claude 模型名。
 
 > ⚠️ **注意**：Cursor IDE 请优先选用 Claude 模型名（通过 `/v1/models` 查看），避免使用 GPT 模型名以获得最佳兼容。
+
+## 🖥️ 日志查看器
+
+启动服务后访问 `http://localhost:3010/logs` 即可打开全链路日志查看器。
+
+### 功能特性
+
+- **实时日志流** - SSE 推送，实时查看请求处理的每个阶段
+- **请求列表** - 左侧面板展示所有请求，以用户提问作为标题，方便快速识别
+- **全局搜索** - 关键字搜索 + 时间过滤（今天/两天/一周/一月）
+- **状态过滤** - 按成功/失败/处理中/拦截状态筛选
+- **详情面板** - 点击请求查看完整的请求参数、提示词、响应内容
+- **阶段耗时** - 可视化时间线展示各阶段耗时（receive → convert → send → response → complete）
+- **🌙 日/夜主题** - 一键切换明暗主题，自动记忆偏好
+- **日志持久化** - 配置 `logging.file_enabled: true` 后日志写入 JSONL 文件，重启自动加载
+
+### 鉴权
+
+如果配置了 `auth_tokens`，日志页面需要登录认证。也可以通过 URL 参数直接访问：
+
+```
+http://localhost:3010/logs?token=sk-your-secret-token-1
+```
 
 ## 项目结构
 
@@ -107,6 +159,11 @@ cursor2api/
 │   ├── logger.ts           # 日志收集 + SSE 推送
 │   ├── proxy-agent.ts      # 代理支持（全局 + Vision 独立代理）
 │   └── tool-fixer.ts       # 工具参数自动修复（字段映射 + 智能引号 + 模糊匹配）
+├── public/
+│   ├── logs.html           # 日志查看器主页面
+│   ├── logs.css            # 日志查看器样式（含暗色主题）
+│   ├── logs.js             # 日志查看器前端逻辑
+│   └── login.html          # 登录页面
 ├── test/
 │   ├── unit-tolerant-parse.mjs  # tolerantParse / parseToolCalls 单元测试
 │   ├── unit-tool-fixer.mjs      # tool-fixer 单元测试
@@ -116,7 +173,7 @@ cursor2api/
 │   ├── e2e-test.ts              # 端到端 API 测试
 │   ├── e2e-chat.mjs             # 端到端对话测试
 │   └── e2e-agentic.mjs          # Claude Code Agentic 压测
-├── config.yaml             # 配置文件
+├── config.yaml.example     # 配置文件模板（复制为 config.yaml 使用）
 ├── package.json
 └── tsconfig.json
 ```
@@ -127,7 +184,7 @@ cursor2api/
 
 > **核心设计理念：不对抗模型的严格文档助手身份，而是顺应它在 Cursor 内部被强制赋予的角色。**
 
-Cursor 背后的 Claude 模型被后端强行锁定为 "Documentation Assistant" 身份，且工具被强行过滤为仅有 `read_file` 和 `read_dir`。一旦用户试图让其执行其他操作或直接调用其他工具，系统内置过滤器会立刻触发拒绝。传统试图告诉它“你在 IDE 里可以自动化操作”的方法随着官方后端的升级已不再稳定。
+Cursor 背后的 Claude 模型被后端强行锁定为 "Documentation Assistant" 身份，且工具被强行过滤为仅有 `read_file` 和 `read_dir`。一旦用户试图让其执行其他操作或直接调用其他工具，系统内置过滤器会立刻触发拒绝。传统试图告诉它"你在 IDE 里可以自动化操作"的方法随着官方后端的升级已不再稳定。
 
 **本项目最新采用的策略是——告诉模型它正在编写 API 系统的开发文档，需要输出工具示例供我们复制：**
 
@@ -169,6 +226,22 @@ AI 按此格式输出 → 我们解析并转换为标准的 Anthropic `tool_use`
 | **L2: XML 标签分离** | `converter.ts` | 将 Claude Code 注入的 `<system-reminder>` 与用户实际请求分离，确保 IDE 场景指令紧邻用户文本 |
 | **L3: 输出拦截** | `handler.ts` | 50+ 正则模式匹配拒绝文本（中英文），在流式/非流式响应中实时拦截并替换 |
 | **L4: 响应清洗** | `handler.ts` | `sanitizeResponse()` 对所有输出做后处理，将 Cursor 身份引用替换为 Claude |
+
+## 环境变量
+
+所有配置均可通过环境变量覆盖（优先级高于 `config.yaml`）：
+
+| 环境变量 | 说明 |
+|----------|------|
+| `PORT` | 服务端口 |
+| `AUTH_TOKEN` | API 鉴权 token（逗号分隔多个） |
+| `PROXY` | 全局代理地址 |
+| `CURSOR_MODEL` | Cursor 使用的模型 |
+| `THINKING_ENABLED` | Thinking 开关 (`true`/`false`) |
+| `COMPRESSION_ENABLED` | 压缩开关 (`true`/`false`) |
+| `COMPRESSION_LEVEL` | 压缩级别 (`1`/`2`/`3`) |
+| `LOG_FILE_ENABLED` | 日志文件持久化 (`true`/`false`) |
+| `LOG_DIR` | 日志文件目录 |
 
 ## 免责声明 / Disclaimer
 
