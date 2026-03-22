@@ -97,6 +97,19 @@ export function listModels(_req: Request, res: Response): void {
 
 // ==================== Token 计数 ====================
 
+/**
+ * 对实际发往 Cursor 的完整消息内容做 token 估算（用于与 Cursor 返回值对比）
+ */
+export function estimateCursorReqTokens(cursorReq: CursorChatRequest): number {
+    let total = 0;
+    for (const msg of cursorReq.messages) {
+        for (const part of msg.parts) {
+            total += estimateTokens(part.text ?? '');
+        }
+    }
+    return total;
+}
+
 export function estimateInputTokens(body: AnthropicRequest): number {
     let total = 0;
 
@@ -479,6 +492,8 @@ function toolCallNeedsMoreContinuation(toolCall: ParsedToolCall): boolean {
  */
 export function shouldAutoContinueTruncatedToolResponse(text: string, hasTools: boolean): boolean {
     if (!hasTools || !isTruncated(text)) return false;
+    // 响应过短（< 200 chars）时不触发续写：上下文不足会导致模型拒绝或错误续写
+    if (text.trim().length < 200) return false;
     if (!hasToolCalls(text)) return true;
 
     const { toolCalls } = parseToolCalls(text);
@@ -677,7 +692,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             ],
         };
 
-        const continuationResponse = await sendCursorRequestFull(continuationReq);
+        const { text: continuationResponse } = await sendCursorRequestFull(continuationReq);
         if (continuationResponse.trim().length === 0) break;
 
         const deduped = deduplicateContinuation(fullText, continuationResponse);
@@ -1005,9 +1020,12 @@ async function handleDirectTextStream(
         ? sanitizeResponse(finalVisibleText)
         : finalTextToSend;
     log.recordFinalResponse(finalRecordedResponse);
+    const estimatedInput1 = estimateCursorReqTokens(activeCursorReq);
+    const actualInput1 = cursorUsage?.inputTokens;
+    console.log(`[TokenDiff] 流式(无工具) 估算(我们发的)=${estimatedInput1} Cursor实际=${actualInput1 ?? 'N/A'} Cursor隐藏开销=${actualInput1 != null ? (actualInput1 - estimatedInput1) : 'N/A'}`);
     log.updateSummary({
-        inputTokens: cursorUsage?.inputTokens ?? estimateInputTokens(body),
-        outputTokens: cursorUsage?.outputTokens ?? estimateTokens(finalRecordedResponse),
+        inputTokens: cursorUsage?.inputTokens,
+        outputTokens: cursorUsage?.outputTokens,
     });
     log.complete(finalRecordedResponse.length, 'end_turn');
 
@@ -1658,9 +1676,12 @@ Please go ahead and pick the most appropriate tool for the current task and outp
 
         // ★ 记录完成
         log.recordFinalResponse(fullResponse);
+        const estimatedInput2 = estimateCursorReqTokens(activeCursorReq);
+        const actualInput2 = cursorUsage?.inputTokens;
+        console.log(`[TokenDiff] 流式(有工具) 估算(我们发的)=${estimatedInput2} Cursor实际=${actualInput2 ?? 'N/A'} Cursor隐藏开销=${actualInput2 != null ? (actualInput2 - estimatedInput2) : 'N/A'}`);
         log.updateSummary({
-            inputTokens: cursorUsage?.inputTokens ?? estimateInputTokens(body),
-            outputTokens: cursorUsage?.outputTokens ?? estimateTokens(fullResponse),
+            inputTokens: cursorUsage?.inputTokens,
+            outputTokens: cursorUsage?.outputTokens,
         });
         log.complete(fullResponse.length, stopReason);
 
@@ -1695,7 +1716,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     try {
     log.startPhase('send', '发送到 Cursor (非流式)');
     const apiStart = Date.now();
-    let fullText = await sendCursorRequestFull(cursorReq);
+    let { text: fullText, usage: cursorUsage } = await sendCursorRequestFull(cursorReq);
     log.recordTTFT();
     log.recordCursorApiTime(apiStart);
     log.recordRawResponse(fullText);
@@ -1738,7 +1759,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
             log.updateSummary({ retryCount });
             const retryBody = buildRetryRequest(body, attempt);
             activeCursorReq = await convertToCursorRequest(retryBody);
-            fullText = await sendCursorRequestFull(activeCursorReq);
+            ({ text: fullText, usage: cursorUsage } = await sendCursorRequestFull(activeCursorReq));
             // 重试后也需要剥离 thinking 标签
             if (hasLeadingThinking(fullText)) {
                 const { thinkingContent: retryThinking, strippedText: retryStripped } = extractThinking(fullText);
@@ -1768,7 +1789,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
         retryCount++;
         log.warn('Handler', 'retry', `非流式响应过短 (${fullText.length} chars)，重试第${retryCount}次`);
         activeCursorReq = await convertToCursorRequest(body);
-        fullText = await sendCursorRequestFull(activeCursorReq);
+        ({ text: fullText, usage: cursorUsage } = await sendCursorRequestFull(activeCursorReq));
         log.info('Handler', 'retry', `非流式重试响应: ${fullText.length} chars`, { preview: fullText.substring(0, 200) });
     }
 
@@ -1813,7 +1834,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             ],
         };
 
-        const continuationResponse = await sendCursorRequestFull(continuationReq);
+        const { text: continuationResponse } = await sendCursorRequestFull(continuationReq);
 
         if (continuationResponse.trim().length === 0) {
             log.warn('Handler', 'continuation', '非流式续写返回空响应，停止续写');
@@ -1919,7 +1940,7 @@ Please go ahead and pick the most appropriate tool for the current task and outp
                 },
             ];
             activeCursorReq = { ...activeCursorReq, messages: forceMessages };
-            fullText = await sendCursorRequestFull(activeCursorReq);
+            ({ text: fullText } = await sendCursorRequestFull(activeCursorReq));
             ({ toolCalls, cleanText } = parseToolCalls(fullText));
         }
         if (toolChoice?.type === 'any' && toolCalls.length === 0) {
@@ -1983,7 +2004,10 @@ Please go ahead and pick the most appropriate tool for the current task and outp
 
     // ★ 记录完成
     log.recordFinalResponse(fullText);
-    log.updateSummary({ inputTokens: estimateInputTokens(body), outputTokens: estimateTokens(fullText) });
+    const estimatedInput = estimateCursorReqTokens(activeCursorReq);
+    const actualInput = cursorUsage?.inputTokens;
+    console.log(`[TokenDiff] 非流式 估算(我们发的)=${estimatedInput} Cursor实际=${actualInput ?? 'N/A'} Cursor隐藏开销=${actualInput != null ? (actualInput - estimatedInput) : 'N/A'}`);
+    log.updateSummary({ inputTokens: cursorUsage?.inputTokens, outputTokens: cursorUsage?.outputTokens });
     log.complete(fullText.length, stopReason);
 
     } catch (err: unknown) {

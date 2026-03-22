@@ -682,17 +682,21 @@ I will ALWAYS use this exact \`\`\`json action\`\`\` block format for tool calls
     if (maxHistoryTokens >= 0) {
         const fewShotOffset2 = hasTools ? 2 : 0;
 
-        // 估算系统提示 token 数
+        // 直接对已构建的 few-shot 消息（系统提示+工具定义+few-shot回复）调用 estimateTokens
+        // 比 tools.length*70+350 更准确，因为实际注入文字已经在 messages[0..fewShotOffset2-1] 中
         let overhead = 0;
-        if (req.system) {
-            const sysStr = typeof req.system === 'string' ? req.system : JSON.stringify(req.system);
-            overhead += estimateTokens(sysStr);
+        for (let i = 0; i < fewShotOffset2; i++) {
+            overhead += estimateTokens(messages[i].parts.map(p => p.text ?? '').join(''));
         }
-        // 估算工具定义 token 数（压缩后约 70 tokens/工具 + 350 固定开销）
-        if (req.tools && req.tools.length > 0) {
-            overhead += req.tools.length * 70;
-            overhead += 350;
-        }
+        // Cursor 后端额外开销：基础隐藏系统提示（实测约 1300 tokens）+ 工具 tokenizer 差异
+        // 注意：工具定义已通过 buildToolInstructions 转为文本注入 messages[0]，并已在上方 estimateTokens 中计算
+        // Cursor 后端对工具的额外 tokenizer 差异与 schema_mode 强相关：
+        //   compact模式 ~20 tokens/工具，full模式 ~240 tokens/工具，names_only ~5 tokens/工具
+        // 输出空间不在此预留，由用户通过 max_history_tokens 自行控制
+        const toolCount = req.tools?.length ?? 0;
+        const schemaMode = getConfig().tools?.schemaMode ?? 'compact';
+        const perToolOverhead = schemaMode === 'full' ? 240 : (schemaMode === 'names_only' ? 5 : 20);
+        overhead += 1300 + toolCount * perToolOverhead;
 
         const historyBudget = Math.max(0, maxHistoryTokens - overhead);
 

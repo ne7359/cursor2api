@@ -28,7 +28,7 @@
               <Field label="max_history_messages" desc="按条数裁剪历史（保留工具 few-shot 示例）。注意：条数无法反映实际 token 体积，建议改用下方的 max_history_tokens。-1 不限制">
                 <input v-model.number="draft.max_history_messages" type="number" min="-1" class="inp" />
               </Field>
-              <Field label="max_history_tokens" desc="按 token 数裁剪历史（推荐）。从最早消息整条删除，有助于减少超出 Cursor 上下文的概率。注意：tiktoken 与 Claude 实际 tokenizer 有差异，低估约 10~20%，默认 130000，参考值 120000~140000，建议观察 UI 日志的实际输入 tokens 后调整。-1 不限制">
+              <Field label="max_history_tokens" desc="按 token 数裁剪历史（推荐）。从最早消息整条删除，有助于减少超出 Cursor 上下文的概率。代码自动补偿 Cursor 后端开销（1,300 基础 + 工具 tokenizer 差异，动态计算），默认 150000，参考值 130000~170000。-1 不限制">
                 <input v-model.number="draft.max_history_tokens" type="number" min="-1" class="inp" />
               </Field>
             </Group>

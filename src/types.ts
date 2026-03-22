@@ -116,7 +116,7 @@ export interface AppConfig {
     authTokens?: string[];  // API 鉴权 token 列表，为空则不鉴权
     maxAutoContinue: number;        // 自动续写最大次数，默认 3，设 0 禁用
     maxHistoryMessages: number;     // 历史消息条数硬限制，默认 -1（不限制）
-    maxHistoryTokens: number;       // 历史消息 token 数上限（js-tiktoken 估算），默认 130000，-1 不限制
+    maxHistoryTokens: number;       // 历史消息 token 数上限（tiktoken 估算我们发出的内容，代码自动加 Cursor 后端开销：1300 基础 + perTool*工具数），默认 150000，-1 不限制
     vision?: {
         enabled: boolean;
         mode: 'ocr' | 'api';

@@ -195,7 +195,7 @@ function defaultConfig(): AppConfig {
         cursorModel: 'anthropic/claude-sonnet-4.6',
         maxAutoContinue: 0,
         maxHistoryMessages: -1,
-        maxHistoryTokens: 130000,
+        maxHistoryTokens: 150000,
         sanitizeEnabled: false,  // 默认关闭响应内容清洗
         fingerprint: {
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
